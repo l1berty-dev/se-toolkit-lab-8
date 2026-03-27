@@ -5,9 +5,11 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import sys
 from collections.abc import Awaitable, Callable, Sequence
 from typing import Any
 
+import httpx
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp.types import TextContent, Tool
@@ -16,6 +18,8 @@ from pydantic import BaseModel, Field
 from mcp_lms.client import LMSClient
 
 _base_url: str = ""
+_logs_base_url: str = ""
+_traces_base_url: str = ""
 
 server = Server("lms")
 
@@ -36,6 +40,24 @@ class _TopLearnersQuery(_LabQuery):
     limit: int = Field(
         default=5, ge=1, description="Max learners to return (default 5)."
     )
+
+
+class _LogsSearchQuery(BaseModel):
+    query: str = Field(description="LogsQL query string.")
+    limit: int = Field(default=10, ge=1, description="Max logs to return.")
+
+
+class _LogsErrorCountQuery(BaseModel):
+    window: str = Field(default="1h", description="Time window, e.g. '1h', '24h'.")
+
+
+class _TracesListQuery(BaseModel):
+    service: str = Field(description="Service name to list traces for.")
+    limit: int = Field(default=10, ge=1, description="Max traces to return.")
+
+
+class _TracesGetQuery(BaseModel):
+    trace_id: str = Field(description="Trace ID to fetch.")
 
 
 # ---------------------------------------------------------------------------
@@ -112,6 +134,41 @@ async def _sync_pipeline(_args: _NoArgs) -> list[TextContent]:
     return _text(await _client().sync_pipeline())
 
 
+async def _logs_search(args: _LogsSearchQuery) -> list[TextContent]:
+    async with httpx.AsyncClient() as client:
+        url = f"{_logs_base_url}/select/logsql/query"
+        r = await client.get(url, params={"query": args.query, "limit": args.limit})
+        r.raise_for_status()
+        return [TextContent(type="text", text=r.text)]
+
+
+async def _logs_error_count(args: _LogsErrorCountQuery) -> list[TextContent]:
+    # VictoriaLogs uses _time:> -5m or _time:>-5m. 
+    # Use severity:ERROR AND _time:>-5m style.
+    query = f"severity:ERROR AND _time:>-{args.window}"
+    async with httpx.AsyncClient() as client:
+        url = f"{_logs_base_url}/select/logsql/query"
+        r = await client.get(url, params={"query": query})
+        r.raise_for_status()
+        return [TextContent(type="text", text=r.text)]
+
+
+async def _traces_list(args: _TracesListQuery) -> list[TextContent]:
+    async with httpx.AsyncClient() as client:
+        url = f"{_traces_base_url}/jaeger/api/traces"
+        r = await client.get(url, params={"service": args.service, "limit": args.limit})
+        r.raise_for_status()
+        return [TextContent(type="text", text=r.text)]
+
+
+async def _traces_get(args: _TracesGetQuery) -> list[TextContent]:
+    async with httpx.AsyncClient() as client:
+        url = f"{_traces_base_url}/jaeger/api/traces/{args.trace_id}"
+        r = await client.get(url)
+        r.raise_for_status()
+        return [TextContent(type="text", text=r.text)]
+
+
 # ---------------------------------------------------------------------------
 # Registry: tool name -> (input model, handler, Tool definition)
 # ---------------------------------------------------------------------------
@@ -184,6 +241,30 @@ _register(
     _NoArgs,
     _sync_pipeline,
 )
+_register(
+    "logs_search",
+    "Search logs in VictoriaLogs using LogsQL.",
+    _LogsSearchQuery,
+    _logs_search,
+)
+_register(
+    "logs_error_count",
+    "Find errors in logs over a time window.",
+    _LogsErrorCountQuery,
+    _logs_error_count,
+)
+_register(
+    "traces_list",
+    "List recent traces for a service in VictoriaTraces.",
+    _TracesListQuery,
+    _traces_list,
+)
+_register(
+    "traces_get",
+    "Get details of a specific trace by ID.",
+    _TracesGetQuery,
+    _traces_get,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -216,8 +297,10 @@ async def call_tool(name: str, arguments: dict[str, Any] | None) -> list[TextCon
 
 
 async def main(base_url: str | None = None) -> None:
-    global _base_url
+    global _base_url, _logs_base_url, _traces_base_url
     _base_url = base_url or os.environ.get("NANOBOT_LMS_BACKEND_URL", "")
+    _logs_base_url = os.environ.get("NANOBOT_VICTORIALOGS_URL", "http://victorialogs:9428")
+    _traces_base_url = os.environ.get("NANOBOT_VICTORIATRACES_URL", "http://victoriatraces:10428")
     async with stdio_server() as (read_stream, write_stream):
         init_options = server.create_initialization_options()
         await server.run(read_stream, write_stream, init_options)
